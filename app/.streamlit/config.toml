@@ -1,0 +1,10 @@
+[theme]
+base="light"
+primaryColor="#8B9D83"   # Sage
+backgroundColor="#F5F1E8" # Cream
+secondaryBackgroundColor="#FFFFFF"
+textColor="#3A3D3A"       # Charcoal
+font="sans serif"
+
+[server]
+headless=true

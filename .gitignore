@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+env/
+app/venv/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Local exports / large artifacts
+exports/
+*.pdf
+*.pptx
+*.xlsx
+
+# OS cruft
+.DS_Store
+
+# Keep only the demo CSV we actually ship
+# *.csv
+!app/data.csv
