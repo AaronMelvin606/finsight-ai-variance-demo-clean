@@ -24,3 +24,6 @@ exports/
 # Keep only the demo CSV we actually ship
 # *.csv
 !app/data.csv
+
+# Streamlit secrets (local only)
+app/.streamlit/secrets.toml
