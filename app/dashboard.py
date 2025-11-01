@@ -1,399 +1,368 @@
-# dashboard.py — FinSight AI Variance Demo (Tableau-style, with Waterfall)
-import os, calendar
-from datetime import datetime
-import numpy as np
+# app/dashboard.py
+import io
+from pathlib import Path
 import pandas as pd
+import numpy as np
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
+import plotly.io as pio
+pio.templates.default = "plotly_white"
 
-# ---------- Brand (fallback if utils/brand.py isn't present) ----------
-try:
-    from utils.brand import BRAND
-except Exception:
-    BRAND = {
-        "name": "FinSight AI",
-        "tagline": "AI-powered intelligence for modern finance",
-        "colors": {
-            "primary": "#8B9D83",   # Sage
-            "dark":    "#2C3E2A",   # Forest
-            "cream":   "#F5F1E8",   # Background
-            "charcoal":"#3A3D3A"    # Text
-        },
-        "font": "Inter",
-    }
+from utils.chatbot.engine import answer_query, append_history  # Chatbot integration
 
-PRIMARY   = BRAND["colors"]["primary"]
-CHARCOAL  = BRAND["colors"]["charcoal"]
-CREAM     = BRAND["colors"]["cream"]
-FOREST    = BRAND["colors"]["dark"]
+# --------------------------- Brand & Layout ---------------------------
+BRAND = {
+    "name": "FinSight AI",
+    "colors": {
+        "primary": "#B9D8B3",  # sage
+        "dark": "#2C3E2F",  # forest
+        "cream": "#FFF5E6",  # background
+        "charcoal": "#3A3D3A",  # text
+        "red": "#D84C4C",
+        "green": "#9CCB8F",
+    },
+}
 
-st.set_page_config(page_title="FinSight AI — Variance", layout="wide")
+st.set_page_config(page_title="FinSight AI — Variance Demo", layout="wide", page_icon="📊")
 
-# ---------- Minimalist theme tweaks ----------
-st.markdown(f"""
+st.markdown(
+    f"""
 <style>
-    html, body, [class*="css"] {{
-        font-family: {BRAND['font']}, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-        color: {CHARCOAL};
-        background: {CREAM};
+    .stApp {{
+        background-color: {BRAND["colors"]["cream"]};
     }}
-    .metric-label {{ color:{CHARCOAL}; opacity:.8; font-size:.9rem; }}
-    .metric-value {{ font-weight:700; font-size:1.5rem; }}
-    .metric-warn {{ color:#E67E22; }}
-    .metric-bad  {{ color:#C0392B; }}
-    .metric-good {{ color:#2E7D32; }}
+    .metric .metric-value {{
+        color: {BRAND["colors"]["dark"]} !important;
+    }}
+    section[data-testid="stSidebar"] {{
+        width: 320px;
+    }}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ---------- Login gate ----------
-def login_gate():
-    pw_needed = "APP_PASSWORD" in st.secrets
-    if not pw_needed:
-        return True
-    if "auth_ok" in st.session_state and st.session_state["auth_ok"]:
-        return True
-    st.title("🔒 FinSight AI — Private Demo")
-    pw = st.text_input("Enter access password", type="password")
-    if st.button("Enter"):
-        if pw == st.secrets["APP_PASSWORD"]:
-            st.session_state["auth_ok"] = True
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
-    st.stop()
+# --------------------------- Data Load ---------------------------
+DATA_PATH = Path(__file__).parent / "data.csv"
 
-login_gate()
 
-# ---------- Helpers ----------
-def month_label(yyyymm: str) -> str:
-    # "2025-01" -> "Jan 25"
-    try:
-        y, m = yyyymm.split("-")
-        m = int(m)
-        return f"{calendar.month_abbr[m]} {str(y)[-2:]}"
-    except Exception:
-        return yyyymm
+@st.cache_data
+def load_data(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
 
-def fmt_money(x):
-    try:
-        return "£{:,.0f}".format(x)
-    except Exception:
-        return "£0"
+    for col in ["Accounting_Period", "Department", "Category", "Product"]:
+        if col not in df.columns:
+            df[col] = "All"
 
-def traffic_light(val, threshold_good=0, invert=False):
-    """
-    For EBITDA & Revenue (higher is better) invert=False.
-    For Costs (lower is better) invert=True (so positive variance is 'bad').
-    Returns CSS class.
-    """
-    if invert:
-        if val > 0:  # over budget cost
-            return "metric-bad"
-        elif val < 0:
-            return "metric-good"
-        else:
-            return "metric-warn"
-    else:
-        if val > 0:
-            return "metric-good"
-        elif val < 0:
-            return "metric-bad"
-        else:
-            return "metric-warn"
+    for col in ["Revenue", "Direct_Costs", "Indirect_Costs", "Actual", "Budget"]:
+        if col not in df.columns:
+            df[col] = 0.0
 
-# ---------- Data load & harmonisation ----------
-REQUIRED = ["Date","Product","Department","Category","GL_Code","Account","Budget","Actual"]
-OPTIONAL = ["Forecast","Accounting_Period","Direct_Indirect","Type"]
+    if "Variance_£" not in df.columns:
+        df["Variance_£"] = df["Actual"] - df["Budget"]
+    if "Variance_%" not in df.columns:
+        df["Variance_%"] = np.where(
+            df["Budget"].replace(0, np.nan).notna(), df["Variance_£"] / df["Budget"], 0.0
+        )
+    return df
 
-data_path = os.path.join(os.getcwd(), "data.csv")
-if not os.path.exists(data_path):
-    st.error("`data.csv` not found in the app folder. Place your demo data next to dashboard.py and refresh.")
-    st.stop()
 
-try:
-    df = pd.read_csv(data_path, dtype={"GL_Code":"Int64"})
-except Exception as e:
-    st.error(f"Couldn’t read data.csv: {e}")
-    st.stop()
+df_raw = load_data(DATA_PATH)
 
-# Ensure required cols exist
-missing = [c for c in REQUIRED if c not in df.columns]
-if missing:
-    st.error(f"data.csv is missing required columns: {missing}")
-    st.stop()
+# --------------------------- Sidebar Filters ---------------------------
+st.sidebar.header("Data")
+st.sidebar.caption("Upload CSV (optional)")
+upload = st.sidebar.file_uploader(" ", type=["csv"], label_visibility="collapsed")
+if upload is not None:
+    tmp = pd.read_csv(upload)
+    df_raw = load_data(Path(upload.name)) if False else tmp
 
-# Parse dates & types
-if "Date" in df.columns:
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-for num in ["Budget","Actual","Forecast"]:
-    if num in df.columns:
-        df[num] = pd.to_numeric(df[num], errors="coerce").fillna(0.0)
-
-# Accounting_Period (YYYY-MM) + pretty label
-if "Accounting_Period" not in df.columns:
-    df["Accounting_Period"] = df["Date"].dt.strftime("%Y-%m").fillna("Unknown")
-df["Period_Label"] = df["Accounting_Period"].astype(str).map(month_label)
-
-# Direct/Indirect/Revenue typing if missing
-# Simple NetSuite-ish rule-of-thumb:
-#   <5000  -> Revenue
-#   5000-5999 -> Direct Cost (COGS)
-#   >=6000 -> Indirect (OpEx)
-if "Type" not in df.columns:
-    df["Type"] = np.where(df["GL_Code"].fillna(0) < 5000, "Revenue", "Cost")
-if "Direct_Indirect" not in df.columns:
-    di = np.where(df["GL_Code"].fillna(0) < 5000, "N/A",
-         np.where(df["GL_Code"].between(5000,5999, inclusive="both"), "Direct", "Indirect"))
-    df["Direct_Indirect"] = di
-
-# Variances (GBP & %). We compute vs a chosen base (Budget or Forecast) later too.
-df["VarianceGBP_Budget"] = df["Actual"] - df["Budget"]
-df["VariancePct_Budget"] = df["VarianceGBP_Budget"] / df["Budget"].replace(0, np.nan)
-
-if "Forecast" not in df.columns:
-    df["Forecast"] = 0.0
-df["VarianceGBP_Forecast"] = df["Actual"] - df["Forecast"]
-df["VariancePct_Forecast"] = df["VarianceGBP_Forecast"] / df["Forecast"].replace(0, np.nan)
-
-# ---------- Sidebar: filters ----------
 st.sidebar.header("Filters")
 
-# Product selector (single)
-products = ["All"] + sorted(df["Product"].dropna().unique().tolist())
-product_sel = st.sidebar.selectbox("Product P&L", products, index=0)
 
-# Department / Category (multiselects, dropdown style)
-dept_opts = sorted(df["Department"].dropna().unique().tolist())
-dept_sel = st.sidebar.multiselect("Department", dept_opts, default=dept_opts)
+def ms(label, series: pd.Series):
+    opts = sorted(series.dropna().unique().tolist())
+    return st.sidebar.multiselect(label, opts, default=opts)
 
-cat_opts = sorted(df["Category"].dropna().unique().tolist())
-cat_sel = st.sidebar.multiselect("Category", cat_opts, default=cat_opts)
 
-# Period (single)
-period_opts = df[["Accounting_Period","Period_Label"]].drop_duplicates().sort_values("Accounting_Period")
-period_label_map = dict(zip(period_opts["Period_Label"], period_opts["Accounting_Period"]))
-label_opts = period_opts["Period_Label"].tolist()
-period_label_sel = st.sidebar.selectbox("Accounting Period", label_opts, index=len(label_opts)-1)
-period_sel = period_label_map[period_label_sel]
+sel_periods = ms("Accounting Period", df_raw["Accounting_Period"])
+sel_departments = ms("Department", df_raw["Department"])
+sel_categories = ms("Category", df_raw["Category"])
+sel_products = ms("Product", df_raw["Product"])
 
-# Scenario base
-scenario = st.sidebar.selectbox("Scenario (base for variance)", ["Budget","Forecast"], index=0)
-
-# Materiality slider (by %)
-materiality = st.sidebar.slider("Materiality threshold (absolute %)", 0.0, 0.50, 0.05, 0.01)
-
-# ---------- Apply filters ----------
-mask = (df["Accounting_Period"] == period_sel)
-if product_sel != "All":
-    mask &= (df["Product"] == product_sel)
-mask &= df["Department"].isin(dept_sel)
-mask &= df["Category"].isin(cat_sel)
-
-dff = df.loc[mask].copy()
-
-# Choose variance vs base
-if scenario == "Budget":
-    dff["Base"] = dff["Budget"]
-    dff["VarianceGBP"] = dff["VarianceGBP_Budget"]
-    dff["VariancePct"] = dff["VariancePct_Budget"]
-else:
-    dff["Base"] = dff["Forecast"]
-    dff["VarianceGBP"] = dff["VarianceGBP_Forecast"]
-    dff["VariancePct"] = dff["VariancePct_Forecast"]
-
-# ---------- Executive summary (Revenue / Direct / Indirect / EBITDA) ----------
-grp = dff.groupby("Type")[["Base","Actual"]].sum()
-rev_base  = grp.loc["Revenue","Base"]  if "Revenue"  in grp.index else 0.0
-rev_act   = grp.loc["Revenue","Actual"] if "Revenue" in grp.index else 0.0
-
-direct = dff[dff["Direct_Indirect"]=="Direct"][["Base","Actual"]].sum()
-indir  = dff[dff["Direct_Indirect"]=="Indirect"][["Base","Actual"]].sum()
-
-direct_base, direct_act = float(direct["Base"]), float(direct["Actual"])
-ind_base,    ind_act    = float(indir["Base"]),  float(indir["Actual"])
-
-ebitda_base = rev_base - direct_base - ind_base
-ebitda_act  = rev_act  - direct_act  - ind_act
-
-rev_var = rev_act - rev_base
-dir_var = direct_act - direct_base
-ind_var = ind_act - ind_base
-ebitda_var = ebitda_act - ebitda_base
-
-st.title("🎯 FinSight AI — Variance Dashboard")
-st.caption(f"{BRAND['tagline']} • Period: **{period_label_sel}** • Scenario: **{scenario}**")
-
-# KPI row
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-with kpi1:
-    st.markdown(f"<div class='metric-label'>Revenue (vs {scenario})</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='metric-value {traffic_light(rev_var, invert=False)}'>{fmt_money(rev_act)} "
-                f"<span style='opacity:.6'>({fmt_money(rev_var)})</span></div>", unsafe_allow_html=True)
-with kpi2:
-    st.markdown(f"<div class='metric-label'>Direct Costs (vs {scenario})</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='metric-value {traffic_light(dir_var, invert=True)}'>{fmt_money(direct_act)} "
-                f"<span style='opacity:.6'>({fmt_money(dir_var)})</span></div>", unsafe_allow_html=True)
-with kpi3:
-    st.markdown(f"<div class='metric-label'>Indirect Costs (vs {scenario})</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='metric-value {traffic_light(ind_var, invert=True)}'>{fmt_money(ind_act)} "
-                f"<span style='opacity:.6'>({fmt_money(ind_var)})</span></div>", unsafe_allow_html=True)
-with kpi4:
-    st.markdown(f"<div class='metric-label'>EBITDA (vs {scenario})</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='metric-value {traffic_light(ebitda_var, invert=False)}'>{fmt_money(ebitda_act)} "
-                f"<span style='opacity:.6'>({fmt_money(ebitda_var)})</span></div>", unsafe_allow_html=True)
-
-st.divider()
-
-# ---------- Visual Analytics ----------
-st.subheader("📊 Visual Analytics")
-
-# Variance by Department (bar)
-dept_var = (dff.groupby("Department")[["VarianceGBP"]]
-            .sum()
-            .reset_index()
-            .sort_values("VarianceGBP", ascending=True))
-fig_dept = px.bar(
-    dept_var, x="VarianceGBP", y="Department", orientation="h",
-    color="VarianceGBP", color_continuous_scale=["#2E7D32", PRIMARY, "#C0392B"],
-    title="Variance by Department (GBP)", labels={"VarianceGBP":"Variance (GBP)"}
+mask = (
+    df_raw["Accounting_Period"].isin(sel_periods)
+    & df_raw["Department"].isin(sel_departments)
+    & df_raw["Category"].isin(sel_categories)
+    & df_raw["Product"].isin(sel_products)
 )
-fig_dept.update_layout(coloraxis_showscale=False, margin=dict(l=10,r=10,t=50,b=10))
-st.plotly_chart(fig_dept, use_container_width=True)
+df = df_raw.loc[mask].copy()
 
-# Budget vs Actual by Category (grouped bar)
-cat_ba = (dff.groupby("Category")[["Base","Actual"]]
-          .sum().reset_index().sort_values("Actual", ascending=False).head(12))
-fig_cat = go.Figure()
-fig_cat.add_trace(go.Bar(name="Base",   x=cat_ba["Category"], y=cat_ba["Base"]))
-fig_cat.add_trace(go.Bar(name="Actual", x=cat_ba["Category"], y=cat_ba["Actual"]))
-fig_cat.update_layout(barmode="group", title=f"Top Categories — Actual vs {scenario}",
-                      margin=dict(l=10,r=10,t=50,b=10), xaxis_title="", yaxis_title="GBP")
-st.plotly_chart(fig_cat, use_container_width=True)
+# --------------------------- Helpers ---------------------------
+def money(x: float) -> str:
+    try:
+        return f"£{x:,.0f}"
+    except Exception:
+        return str(x)
 
-# 6-month Variance % trend (if data present)
-hist = df.copy()
-hist["Period_Label"] = hist["Accounting_Period"].astype(str).map(month_label)
-if product_sel != "All":
-    hist = hist[hist["Product"] == product_sel]
-hist = hist[hist["Department"].isin(dept_sel) & hist["Category"].isin(cat_sel)]
-if scenario == "Budget":
-    hist["VariancePct"] = (hist["Actual"] - hist["Budget"]) / hist["Budget"].replace(0, np.nan)
+
+def kpi_tiles_financials(df_: pd.DataFrame):
+    revenue = float(df_["Revenue"].sum())
+    direct = float(df_["Direct_Costs"].sum())
+    indirect = float(df_["Indirect_Costs"].sum())
+    ebitda = revenue - direct - indirect
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Revenue", money(revenue))
+    with c2:
+        st.metric("Direct Costs", money(direct))
+    with c3:
+        st.metric("Indirect Costs", money(indirect))
+    with c4:
+        st.metric("EBITDA", money(ebitda))
+
+
+def executive_summary_bullets(df_: pd.DataFrame) -> list[str]:
+    bullets = []
+    total_actual = float(df_["Actual"].sum())
+    total_budget = float(df_["Budget"].sum())
+    var = total_actual - total_budget
+    pct = (var / total_budget) if total_budget else 0.0
+
+    direction = "over" if var > 0 else "under"
+    bullets.append(
+        f"Actual is **{direction}** budget by **{money(abs(var))} ({pct:.1%})** overall."
+    )
+
+    if "Revenue" in df_.columns and "Category" in df_.columns:
+        rev = df_.groupby("Category", as_index=False)["Revenue"].sum()
+        if len(rev):
+            top = rev.sort_values("Revenue", ascending=False).iloc[0]
+            bullets.append(f"Top revenue driver: **{top['Category']}** at {money(top['Revenue'])}.")
+
+    freight = df_[df_["Category"].str.contains("Freight", case=False, na=False)]
+    if len(freight):
+        fv = float(freight["Actual"].sum() - freight["Budget"].sum())
+        if abs(fv) > 0:
+            label = "over" if fv > 0 else "under"
+            bullets.append(f"Freight is **{label}** budget by {money(abs(fv))}.")
+
+    if not bullets:
+        bullets.append("No strong signals detected. Try widening filters.")
+    return bullets
+
+
+# --------------------------- Title ---------------------------
+st.title("FinSight AI — Variance Analysis (Demo)")
+st.caption("Minimalist, board-ready visuals • Sidebar filters are the single source of truth")
+
+# --------------------------- KPI ROWS ---------------------------
+kpi_tiles_financials(df)
+
+tot_actual = float(df["Actual"].sum())
+tot_budget = float(df["Budget"].sum())
+tot_var = tot_actual - tot_budget
+tot_varpct = (tot_var / tot_budget) if tot_budget else 0.0
+
+k1, k2, k3, k4 = st.columns(4)
+with k1:
+    st.metric("Actual", money(tot_actual))
+with k2:
+    st.metric("Budget", money(tot_budget))
+with k3:
+    st.metric("Variance £", money(tot_var))
+with k4:
+    st.metric("Variance %", f"{tot_varpct:.1%}")
+
+# --------------------------- Executive Summary ---------------------------
+st.subheader("Executive Summary 🤖")
+for line in executive_summary_bullets(df):
+    st.markdown(f"- {line}")
+
+# --------------------------- Variance by Period (bar) ---------------------------
+st.subheader("Variance Overview")
+if {"Actual", "Budget", "Accounting_Period"}.issubset(df.columns):
+    g = df.copy()
+    g["Variance_£"] = g["Actual"] - g["Budget"]
+    per = (
+        g.groupby("Accounting_Period", as_index=False)["Variance_£"]
+        .sum()
+        .sort_values("Accounting_Period")
+    )
+    fig_bar = px.bar(
+        per,
+        x="Accounting_Period",
+        y="Variance_£",
+        color="Variance_£",
+        color_continuous_scale=[BRAND["colors"]["red"], BRAND["colors"]["green"]],
+        labels={"Variance_£": "Variance (£)"},
+    )
+    fig_bar.update_layout(coloraxis_showscale=False, plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_bar, use_container_width=True)
 else:
-    hist["VariancePct"] = (hist["Actual"] - hist["Forecast"]) / hist["Forecast"].replace(0, np.nan)
+    st.info("Need Actual, Budget, and Accounting_Period for the variance bar.")
 
-trend = (hist.groupby(["Accounting_Period","Period_Label"])["VariancePct"]
-         .mean().reset_index().sort_values("Accounting_Period").tail(6))
-if not trend.empty:
-    fig_trend = px.line(trend, x="Period_Label", y="VariancePct",
-                        title="Variance % Trend (last 6 periods)",
-                        markers=True)
-    fig_trend.update_layout(yaxis_tickformat=".1%", margin=dict(l=10,r=10,t=50,b=10))
-    st.plotly_chart(fig_trend, use_container_width=True)
+# --------------------------- Variance % Trend ---------------------------
+st.subheader("Variance % Trend")
+if {"Actual", "Budget", "Accounting_Period"}.issubset(df.columns):
+    g = df.copy()
+    g["Variance_%"] = np.where(
+        g["Budget"] != 0, (g["Actual"] - g["Budget"]) / g["Budget"], 0.0
+    )
+    per = (
+        g.groupby("Accounting_Period", as_index=False)["Variance_%"]
+        .mean()
+        .sort_values("Accounting_Period")
+    )
+    fig_line = px.line(
+        per,
+        x="Accounting_Period",
+        y="Variance_%",
+        markers=True,
+        labels={"Variance_%": "Variance %"},
+    )
+    fig_line.update_layout(plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_line, use_container_width=True)
+else:
+    st.info("Need Actual, Budget, and Accounting_Period for the variance % line.")
 
-st.divider()
+# --------------------------- Waterfall ---------------------------
+st.subheader("Waterfall — Budget to Actual (by Category impact)")
+if {"Actual", "Budget", "Category"}.issubset(df.columns):
+    total_budget = float(df["Budget"].sum())
+    total_actual = float(df["Actual"].sum())
+    cat_var = (
+        df.assign(Var=lambda d: d["Actual"] - d["Budget"])
+        .groupby("Category", as_index=False)["Var"]
+        .sum()
+        .sort_values("Var", ascending=True)
+    )
 
-# ---------- Detailed table ----------
-st.subheader("📋 Detailed Variance Table")
-table_cols = ["Product","Department","Category","GL_Code","Account","Base","Actual","VarianceGBP","VariancePct"]
-tbl = dff[table_cols].copy()
-tbl["VariancePct"] = tbl["VariancePct"].fillna(0.0)
-# Materiality filter
-tbl = tbl[ tbl["VariancePct"].abs() >= materiality ]
-st.dataframe(tbl.sort_values("VarianceGBP", ascending=False), use_container_width=True)
+    x_labels = ["Total Budget"] + cat_var["Category"].tolist() + ["Total Actual"]
+    measures = ["absolute"] + ["relative"] * len(cat_var) + ["total"]
+    y_values = [total_budget] + cat_var["Var"].tolist() + [total_actual]
 
-st.divider()
+    fig_wf = go.Figure(
+        go.Waterfall(
+            x=x_labels,
+            measure=measures,
+            y=y_values,
+            connector={"line": {"color": BRAND["colors"]["charcoal"]}},
+            increasing={"marker": {"color": BRAND["colors"]["green"]}},
+            decreasing={"marker": {"color": BRAND["colors"]["red"]}},
+            totals={"marker": {"color": BRAND["colors"]["dark"]}},
+        )
+    )
+    fig_wf.update_layout(showlegend=False, plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_wf, use_container_width=True)
+else:
+    st.info("Need Actual, Budget, and Category columns for the waterfall.")
 
-# ---------- Waterfall: EBITDA bridge ----------
-st.subheader("🪄 EBITDA Variance Bridge")
+# --------------------------- Detailed Variance Table ---------------------------
+st.subheader("Detailed Variance Table")
+detail_cols = [
+    c
+    for c in [
+        "Accounting_Period",
+        "Department",
+        "Category",
+        "Product",
+        "Budget",
+        "Actual",
+        "Variance_£",
+        "Variance_%",
+    ]
+    if c in df.columns
+]
+table_df = df[detail_cols] if detail_cols else df
+st.dataframe(
+    table_df.sort_values(
+        detail_cols[:4] if len(detail_cols) >= 4 else table_df.columns.tolist()
+    ),
+    use_container_width=True,
+)
 
-# Bridge components: deltas between Actual and Base for Revenue, Direct, Indirect
-wf_labels  = ["EBITDA (Base)","Revenue Δ","Direct Costs Δ","Indirect Costs Δ","EBITDA (Actual)"]
-wf_values  = [ebitda_base, rev_var, -dir_var, -ind_var, ebitda_act]  # costs deltas invert in display
-wf_measures= ["absolute","relative","relative","relative","absolute"]
+# --------------------------- Export Options ---------------------------
+st.subheader("Export Options")
 
-fig_wf = go.Figure(go.Waterfall(
-    name="EBITDA Bridge",
-    orientation="h",
-    measure=wf_measures,
-    y=wf_labels,
-    x=wf_values,
-    connector={"line":{"color":CHARCOAL,"width":1}},
-    decreasing={"marker":{"color":"#C0392B"}},
-    increasing={"marker":{"color":"#2E7D32"}},
-    totals={"marker":{"color":PRIMARY}}
-))
-fig_wf.update_layout(title="EBITDA Variance Waterfall", margin=dict(l=40,r=20,t=50,b=20))
-st.plotly_chart(fig_wf, use_container_width=True)
-
-# ---------- Tiny export (Excel) ----------
-st.subheader("Export")
-def to_excel_bytes(df_in: pd.DataFrame) -> bytes:
-    import io
-    import xlsxwriter
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
-        df_in.to_excel(xw, sheet_name="Detailed", index=False)
-        summary = df_in.groupby("Accounting_Period")[["Base","Actual"]].sum()
-        summary["VarianceGBP"] = summary["Actual"] - summary["Base"]
-        summary["VariancePct"] = summary["VarianceGBP"] / summary["Base"].replace(0, np.nan)
-        summary.to_excel(xw, sheet_name="Summary")
-    out.seek(0)
-    return out.read()
-
+out_xlsx = io.BytesIO()
+with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
+    table_df.to_excel(writer, index=False, sheet_name="Variance Detail")
 st.download_button(
-    "📥 Download Excel (filtered)",
-    data=to_excel_bytes(dff),
-    file_name=f"FinSight-Variance-{period_sel.replace('-','')}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    "📥 Export to Excel",
+    data=out_xlsx.getvalue(),
+    file_name="finsight_variance_detail.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
-
-# ====== Chat with your data (offline, grounded) ======
-st.divider()
-st.subheader("💬 Ask your data")
 
 try:
-    from utils.chatbot_engine import ask as qa_ask, QAResult
-except Exception as e:
-    st.info("Chatbot engine not found (utils/chatbot_engine.py). Add it to enable CFO chat.")
-else:
-    if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = []
+    from pptx import Presentation
+    from pptx.util import Inches
 
-    with st.container():
-        # Show history
-        for role, msg in st.session_state["chat_history"]:
-            with st.chat_message(role):
-                st.markdown(msg)
+    def build_ppt(df_table: pd.DataFrame) -> bytes:
+        prs = Presentation()
+        title = prs.slides.add_slide(prs.slide_layouts[0])
+        title.shapes.title.text = "FinSight AI — Variance Summary"
+        title.placeholders[1].text = "Auto-generated export for board-ready review."
 
-        # Input
-        prompt = st.chat_input(
-            "Ask things like: 'What is EBITDA this period?', "
-            "'Top 5 overspends', 'Department Marketing', 'Category Software'"
-        )
-        if prompt:
-            # Echo user
-            st.session_state["chat_history"].append(("user", prompt))
-            with st.chat_message("user"):
-                st.markdown(prompt)
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        shapes = slide.shapes
+        rows = min(18, len(df_table) + 1)
+        cols = min(len(df_table.columns), 8)
+        table = shapes.add_table(
+            rows, cols, Inches(0.5), Inches(1.0), Inches(12.8), Inches(5.5)
+        ).table
 
-            # Answer from the filtered data (ground truth)
-            result: QAResult = qa_ask(dff, scenario, period_label_sel, product_sel, prompt)
+        headers = list(df_table.columns)[:cols]
+        for j, h in enumerate(headers):
+            table.cell(0, j).text = str(h)
+        for i in range(1, rows):
+            if i - 1 >= len(df_table):
+                break
+            for j in range(cols):
+                table.cell(i, j).text = str(df_table.iloc[i - 1, j])
 
-            # Render assistant
-            with st.chat_message("assistant"):
-                st.markdown(result.answer)
-                if result.table is not None and not result.table.empty:
-                    st.dataframe(result.table, use_container_width=True)
-                if result.figure is not None:
-                    st.plotly_chart(result.figure, use_container_width=True)
-                if result.debug:
-                    with st.expander("Debug (schema)"):
-                        st.code(result.debug)
+        bio = io.BytesIO()
+        prs.save(bio)
+        return bio.getvalue()
 
-            # Save answer to history
-            st.session_state["chat_history"].append(("assistant", result.answer))
+    ppt_bytes = build_ppt(table_df)
+    st.download_button(
+        "🖼️ Export to PowerPoint",
+        data=ppt_bytes,
+        file_name="finsight_variance.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+    st.download_button(
+        "🟡 Export to Google Slides",
+        data=ppt_bytes,
+        file_name="finsight_variance_for_slides.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        help="Import this .pptx into Google Slides.",
+    )
+except Exception:
+    st.warning("PowerPoint export requires `python-pptx` (pip install python-pptx).")
 
+# --------------------------- Chatbot ---------------------------
+st.subheader("Ask your data 💬")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-# ---------- Footer ----------
-st.caption(f"© {datetime.now().year} {BRAND['name']} • Minimalist, board-ready visuals • {BRAND['tagline']}")
+for msg in st.session_state.chat_history:
+    role = "🧑‍💼" if msg["role"] == "user" else "🤖"
+    st.markdown(f"**{role} {msg['role'].title()}:** {msg['content']}")
+
+q = st.text_input("Type a question (e.g., 'Top 5 overspends', 'EBITDA in Jun 25')", "")
+if st.button("Ask") and q.strip():
+    ctx = {
+        "Product": sel_products,
+        "Department": sel_departments,
+        "Category": sel_categories,
+        "Accounting_Period": sel_periods,
+    }
+    st.session_state.chat_history = append_history(st.session_state.chat_history, "user", q)
+    reply = answer_query(df, q, ctx)
+    st.session_state.chat_history = append_history(st.session_state.chat_history, "assistant", reply)
+    st.experimental_rerun()

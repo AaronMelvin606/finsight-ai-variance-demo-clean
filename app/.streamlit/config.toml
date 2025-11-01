@@ -1,10 +1,12 @@
 [theme]
-base="light"
-primaryColor="#8B9D83"   # Sage
-backgroundColor="#F5F1E8" # Cream
-secondaryBackgroundColor="#FFFFFF"
-textColor="#3A3D3A"       # Charcoal
-font="sans serif"
+base = "light"
+primaryColor = "#2C3E2F"            # forest
+backgroundColor = "#FFF5E6"         # cream
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#3A3D3A"               # charcoal
+font = "sans serif"
 
 [server]
-headless=true
+headless = true
+enableCORS = false
+enableXsrfProtection = true
